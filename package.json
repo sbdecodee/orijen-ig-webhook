@@ -1,0 +1,7 @@
+{
+  "name": "orijen-ig-webhook",
+  "private": true,
+  "engines": {
+    "node": "20.x"
+  }
+}
