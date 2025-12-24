@@ -6,30 +6,37 @@ import nodemailer from "nodemailer";
 // =========================
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "orijen_rd_verify_2025";
 
-// Instagram Messaging (token IGA... del asistente / Instagram Login)
-const IG_ACCESS_TOKEN = (process.env.IG_ACCESS_TOKEN || "").trim();
-
-// Facebook Page Messenger (si usas FB Messenger)
-const PAGE_ACCESS_TOKEN = (process.env.PAGE_ACCESS_TOKEN || "").trim();
+// Tokens
+// IMPORTANTe: Para responder DMs (IG/FB) usa Page Access Token (Messenger API).
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || ""; // Messenger/IG DMs via /me/messages
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "";     // Instagram Graph (comentarios / replies)
 
 // Email
 const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "gmail";
-const EMAIL_USER = (process.env.EMAIL_USER || "").trim();
-const EMAIL_PASS = (process.env.EMAIL_PASS || "").trim();
-const EMAIL_FROM = (process.env.EMAIL_FROM || EMAIL_USER).trim();
-const EMAIL_TO_DEFAULT = (process.env.EMAIL_TO_DEFAULT || "sbernal@decodeegroup.com").trim();
+const EMAIL_USER = process.env.EMAIL_USER || "";
+const EMAIL_PASS = process.env.EMAIL_PASS || "";
+const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
+const EMAIL_TO_DEFAULT = process.env.EMAIL_TO_DEFAULT || "sbernal@decodeegroup.com";
 
-// Opcionales por área
-const EMAIL_TO_SALES = (process.env.EMAIL_TO_SALES || EMAIL_TO_DEFAULT).trim();
-const EMAIL_TO_PRICING = (process.env.EMAIL_TO_PRICING || EMAIL_TO_DEFAULT).trim();
-const EMAIL_TO_EMERGENCY = (process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT).trim();
+// Opcionales por área (si no existen, cae al default)
+const EMAIL_TO_SALES = process.env.EMAIL_TO_SALES || EMAIL_TO_DEFAULT;
+const EMAIL_TO_PRICING = process.env.EMAIL_TO_PRICING || EMAIL_TO_DEFAULT;
+const EMAIL_TO_EMERGENCY = process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT;
 
 // =========================
-// KEYWORDS
+// KEYWORDS (ajústalas)
 // =========================
-const KW_PRICING = ["precio", "precios", "cuanto", "cuánto", "costo", "costos", "vale", "valor", "tarifa", "promoción", "promo"];
-const KW_SALES = ["comprar", "compra", "pedido", "orden", "cotizar", "cotización", "stock", "disponible", "envío", "delivery", "tienda", "distribuidor"];
-const KW_EMERGENCY = ["urgente", "emergencia", "intoxicación", "intoxicacion", "vomito", "vómito", "convulsión", "convulsion", "sangre", "accidente"];
+const KW_PRICING = [
+  "precio", "precios", "cuanto", "cuánto", "costo", "costos", "vale", "valor", "tarifa", "promoción", "promo",
+];
+
+const KW_SALES = [
+  "comprar", "compra", "pedido", "orden", "cotizar", "cotización", "stock", "disponible", "envío", "delivery", "tienda", "distribuidor",
+];
+
+const KW_EMERGENCY = [
+  "urgente", "emergencia", "intoxicación", "intoxicacion", "vomito", "vómito", "convulsión", "convulsion", "sangre", "accidente",
+];
 
 // =========================
 // HELPERS
@@ -55,6 +62,7 @@ function pickEmail(category) {
   if (category === "sales") return EMAIL_TO_SALES;
   return EMAIL_TO_DEFAULT;
 }
+
 function buildAutoReply(category) {
   if (category === "emergency") {
     return "¡Gracias por escribirnos! Por seguridad, si tu mascota presenta una situación urgente, contáctanos de inmediato por el canal de emergencias o llama a la clínica. Si puedes, envíanos: especie/edad, síntomas y desde cuándo inició.";
@@ -69,13 +77,35 @@ function buildAutoReply(category) {
 }
 
 // =========================
+// DEDUPE (anti-loop / anti-retry)
+// =========================
+// Meta a veces reintenta o envía múltiples eventos por el mismo mensaje.
+// Guardamos mid->timestamp por un rato para NO contestar repetido.
+const SEEN_TTL_MS = 5 * 60 * 1000; // 5 min
+const seen = new Map(); // mid -> ts
+
+function pruneSeen(now = Date.now()) {
+  for (const [k, ts] of seen.entries()) {
+    if (now - ts > SEEN_TTL_MS) seen.delete(k);
+  }
+}
+function alreadySeen(mid) {
+  if (!mid) return false;
+  const now = Date.now();
+  pruneSeen(now);
+  if (seen.has(mid)) return true;
+  seen.set(mid, now);
+  return false;
+}
+
+// =========================
 // EMAIL
 // =========================
 function getTransporter() {
   if (!EMAIL_USER || !EMAIL_PASS) return null;
 
   return nodemailer.createTransport({
-    service: EMAIL_PROVIDER,
+    service: EMAIL_PROVIDER, // "gmail"
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
   });
 }
@@ -111,43 +141,42 @@ async function sendRoutingEmail({ category, source, text, meta }) {
 }
 
 // =========================
-// HTTP helpers
+// GRAPH API (timeout + retries + logs)
 // =========================
-async function httpJson(url, { method = "GET", headers = {}, body, timeoutMs = 10000 } = {}) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
+async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 8000 } = {}) {
+  const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(accessToken)}`;
 
-  try {
-    const r = await fetch(url, {
-      method,
-      headers,
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
-    });
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), timeoutMs);
 
-    const text = await r.text();
-    let parsed = text;
-    try { parsed = JSON.parse(text); } catch {}
-
-    if (!r.ok) {
-      const err = typeof parsed === "string" ? parsed : JSON.stringify(parsed);
-      throw new Error(`${r.status} ${r.statusText} :: ${err}`);
-    }
-
-    return parsed;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function withRetries(fn, { retries = 2 } = {}) {
-  for (let i = 0; i <= retries; i++) {
     try {
-      return await fn();
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      clearTimeout(t);
+
+      const text = await r.text();
+      if (!r.ok) {
+        console.error("GRAPH_ERROR", { path, status: r.status, body: text });
+        throw new Error(`Graph API ${r.status}: ${text}`);
+      }
+
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
     } catch (e) {
-      console.error("REQ_FAIL", { attempt: i, error: String(e) });
-      if (i === retries) throw e;
-      await sleep(350 * (i + 1));
+      clearTimeout(t);
+      console.error("GRAPH_FETCH_FAIL", { path, attempt, error: String(e) });
+
+      if (attempt === retries) throw e;
+      await sleep(350 * (attempt + 1));
     }
   }
 }
@@ -156,67 +185,29 @@ async function withRetries(fn, { retries = 2 } = {}) {
 // ACTIONS
 // =========================
 
-// ✅ IG DM reply (Instagram Messaging API)
-// Usa el mismo endpoint que te muestra el Asistente: graph.instagram.com/v21.0/me/messages
-async function replyToIGDM(recipientId, message) {
-  if (!IG_ACCESS_TOKEN) {
-    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
-    return;
-  }
-
-  const url = "https://graph.instagram.com/v21.0/me/messages";
-  return withRetries(() =>
-    httpJson(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${IG_ACCESS_TOKEN}`,
-      },
-      body: {
-        recipient: { id: String(recipientId) },
-        message: { text: message },
-      },
-    })
-  );
-}
-
-// ✅ Facebook Page Messenger reply (opcional)
-async function replyToFBPageDM(psid, message) {
-  if (!PAGE_ACCESS_TOKEN) {
-    console.warn("FB_DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
-    return;
-  }
-
-  const url = `https://graph.facebook.com/v24.0/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  return withRetries(() =>
-    httpJson(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: {
-        recipient: { id: String(psid) },
-        message: { text: message },
-      },
-    })
-  );
-}
-
-// ✅ IG comment reply (Graph API)
+// Responder comentario IG:
+// Endpoint: /{comment-id}/replies  { message: "..." }
 async function replyToComment(commentId, message) {
   if (!IG_ACCESS_TOKEN) {
     console.warn("COMMENT_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
     return;
   }
+  return graphPost(`${commentId}/replies`, { message }, IG_ACCESS_TOKEN);
+}
 
-  // Para comentarios suele funcionar con graph.facebook.com + access_token
-  const url = `https://graph.facebook.com/v24.0/${commentId}/replies?access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`;
-
-  return withRetries(() =>
-    httpJson(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: { message },
-    })
-  );
+// Responder DM (IG o FB) vía Messenger API:
+// Endpoint: /me/messages con PAGE_ACCESS_TOKEN
+async function replyToDM(psid, message) {
+  if (!PAGE_ACCESS_TOKEN) {
+    console.warn("DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
+    return;
+  }
+  const payload = {
+    recipient: { id: psid },
+    messaging_type: "RESPONSE",
+    message: { text: message },
+  };
+  return graphPost(`me/messages`, payload, PAGE_ACCESS_TOKEN);
 }
 
 // =========================
@@ -236,67 +227,85 @@ export default async function handler(req, res) {
   }
 
   // 2) EVENTOS
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  if (req.method !== "POST") {
+    return res.status(405).send("Method Not Allowed");
+  }
 
   try {
     const body = req.body || {};
+    const object = body.object || "unknown";
+
     console.log("WEBHOOK_IN", JSON.stringify(body));
 
-    const object = body.object; // "instagram" o "page"
     const entries = Array.isArray(body.entry) ? body.entry : [];
 
     for (const entry of entries) {
       // =========================
-      // A) DM (Instagram o Page)
+      // A) MENSAJES (DM)
       // =========================
+      // Meta manda muchos tipos de eventos en entry.messaging:
+      // - message.text (lo que queremos)
+      // - delivery / read / postback / referral / etc. (NO responder)
       if (Array.isArray(entry.messaging)) {
+        const entryId = String(entry.id || ""); // en IG: IG business id; en FB: page id
+
         for (const m of entry.messaging) {
-          // Ignorar eco mensajes
-          if (m.message?.is_echo) continue;
+          // 0) Ignora eventos no-mensaje (reads/deliveries/etc.)
+          if (m.delivery || m.read || m.postback || m.referral || m.optin) continue;
 
-          const text = m.message?.text || "";
-          const senderId = m.sender?.id; // el id del usuario que escribió
+          // 1) Solo responder si hay texto REAL
+          const text = m?.message?.text;
+          if (typeof text !== "string" || !text.trim()) continue;
 
+          // 2) Ignora eco-messages del propio sistema
+          if (m?.message?.is_echo) continue;
+
+          // 3) Dedupe por message id (evita retries/duplicados)
+          const mid = m?.message?.mid;
+          if (alreadySeen(mid)) {
+            console.log("DM_DUPLICATE_SKIPPED", { mid });
+            continue;
+          }
+
+          const senderId = String(m?.sender?.id || "");
           if (!senderId) continue;
+
+          // 4) Ignora mensajes que "parecen" salir de tu propia cuenta/page (previene loops raros)
+          // (en IG suele venir entry.id como tu IG business id)
+          if (entryId && senderId === entryId) continue;
 
           const category = classify(text);
           const reply = buildAutoReply(category);
 
+          // Responde
           try {
-            if (object === "instagram") {
-              await replyToIGDM(senderId, reply);
-              console.log("IG_DM_REPLIED", { senderId, category });
-            } else if (object === "page") {
-              await replyToFBPageDM(senderId, reply);
-              console.log("FB_DM_REPLIED", { senderId, category });
-            } else {
-              console.warn("DM_SKIPPED_UNKNOWN_OBJECT", object);
-            }
+            await replyToDM(senderId, reply);
+            console.log("DM_REPLIED", { object, senderId, category, mid });
           } catch (e) {
-            console.error("DM_REPLY_FAIL", { object, error: String(e) });
+            console.error("DM_REPLY_FAIL", { object, senderId, error: String(e) });
           }
 
-          // Escalar por correo si aplica
+          // Escala por correo si aplica
           if (category !== "general") {
             await sendRoutingEmail({
               category,
-              source: object === "instagram" ? "IG_DM" : "FB_DM",
+              source: object === "instagram" ? "IG_DM" : "DM",
               text,
-              meta: { senderId, entryId: entry.id || null },
+              meta: { senderId, entryId: entry.id || null, mid },
             });
           }
         }
       }
 
       // =========================
-      // B) COMMENTS (IG)
+      // B) COMMENTS (comentarios)
       // =========================
+      // Estructura común: entry.changes[] con field = "comments" o "live_comments"
       if (Array.isArray(entry.changes)) {
         for (const c of entry.changes) {
           const field = c.field;
           const value = c.value || {};
 
-          // Comentarios (depende del producto puede variar)
           if (field === "comments" || field === "live_comments") {
             const text = value.text || "";
             const commentId = value.id;
@@ -329,8 +338,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("WEBHOOK_FATAL", String(err));
-    // Meta requiere 200 para no reintentar en bucle
+    console.error("WEBHOOK_FATAL", err);
     return res.status(200).json({ ok: true });
   }
 }
