@@ -7,9 +7,10 @@ import nodemailer from "nodemailer";
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "orijen_rd_verify_2025";
 
 // Tokens
-// IMPORTANTe: Para responder DMs (IG/FB) usa Page Access Token (Messenger API).
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || ""; // Messenger/IG DMs via /me/messages
-const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "";     // Instagram Graph (comentarios / replies)
+// IG_ACCESS_TOKEN: para responder COMENTARIOS (Graph IG comment replies)
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "";
+// PAGE_ACCESS_TOKEN: para responder DMs vía /me/messages (Messenger platform / IG messaging)
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";
 
 // Email
 const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "gmail";
@@ -27,15 +28,45 @@ const EMAIL_TO_EMERGENCY = process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT;
 // KEYWORDS (ajústalas)
 // =========================
 const KW_PRICING = [
-  "precio", "precios", "cuanto", "cuánto", "costo", "costos", "vale", "valor", "tarifa", "promoción", "promo",
+  "precio",
+  "precios",
+  "cuanto",
+  "cuánto",
+  "costo",
+  "costos",
+  "vale",
+  "valor",
+  "tarifa",
+  "promoción",
+  "promo",
 ];
 
 const KW_SALES = [
-  "comprar", "compra", "pedido", "orden", "cotizar", "cotización", "stock", "disponible", "envío", "delivery", "tienda", "distribuidor",
+  "comprar",
+  "compra",
+  "pedido",
+  "orden",
+  "cotizar",
+  "cotización",
+  "stock",
+  "disponible",
+  "envío",
+  "delivery",
+  "tienda",
+  "distribuidor",
 ];
 
 const KW_EMERGENCY = [
-  "urgente", "emergencia", "intoxicación", "intoxicacion", "vomito", "vómito", "convulsión", "convulsion", "sangre", "accidente",
+  "urgente",
+  "emergencia",
+  "intoxicación",
+  "intoxicacion",
+  "vomito",
+  "vómito",
+  "convulsión",
+  "convulsion",
+  "sangre",
+  "accidente",
 ];
 
 // =========================
@@ -44,7 +75,10 @@ const KW_EMERGENCY = [
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function norm(s = "") {
-  return String(s).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return String(s)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
 function hasAnyKeyword(text, list) {
   const t = norm(text);
@@ -68,7 +102,7 @@ function buildAutoReply(category) {
     return "¡Gracias por escribirnos! Por seguridad, si tu mascota presenta una situación urgente, contáctanos de inmediato por el canal de emergencias o llama a la clínica. Si puedes, envíanos: especie/edad, síntomas y desde cuándo inició.";
   }
   if (category === "pricing") {
-    return "¡Claro! Te ayudamos con precios. Para cotizar exacto, dime el producto que necesitas y tu ubicación (si aplica). En breve te respondemos con el detalle.";
+    return "¡Claro! Te ayudamos con precios. Para cotizar exacto, dime el producto/servicio que necesitas y tu ubicación (si aplica). En breve te respondemos con el detalle.";
   }
   if (category === "sales") {
     return "¡Perfecto! Para ayudarte con tu compra, dime qué necesitas, cantidad y si es para entrega o recogida. Te respondemos con disponibilidad y pasos a seguir.";
@@ -77,24 +111,33 @@ function buildAutoReply(category) {
 }
 
 // =========================
-// DEDUPE (anti-loop / anti-retry)
+// SIMPLE DEDUPE (serverless best-effort)
 // =========================
-// Meta a veces reintenta o envía múltiples eventos por el mismo mensaje.
-// Guardamos mid->timestamp por un rato para NO contestar repetido.
-const SEEN_TTL_MS = 5 * 60 * 1000; // 5 min
-const seen = new Map(); // mid -> ts
-
-function pruneSeen(now = Date.now()) {
-  for (const [k, ts] of seen.entries()) {
-    if (now - ts > SEEN_TTL_MS) seen.delete(k);
+// Evita duplicados por reintentos de Meta o eventos repetidos.
+// Nota: En serverless no es 100% persistente, pero reduce MUCHO el spam.
+const GLOBAL_KEY = "__ORIJEN_DEDUPE_CACHE__";
+function getCache() {
+  if (!globalThis[GLOBAL_KEY]) {
+    globalThis[GLOBAL_KEY] = new Map(); // key -> expiresAt
   }
+  return globalThis[GLOBAL_KEY];
 }
-function alreadySeen(mid) {
-  if (!mid) return false;
+function seenRecently(key, ttlMs = 10 * 60 * 1000) {
+  if (!key) return false;
+  const cache = getCache();
   const now = Date.now();
-  pruneSeen(now);
-  if (seen.has(mid)) return true;
-  seen.set(mid, now);
+
+  // cleanup ligero
+  if (cache.size > 1000) {
+    for (const [k, exp] of cache.entries()) {
+      if (exp <= now) cache.delete(k);
+    }
+  }
+
+  const exp = cache.get(key);
+  if (exp && exp > now) return true;
+
+  cache.set(key, now + ttlMs);
   return false;
 }
 
@@ -143,8 +186,15 @@ async function sendRoutingEmail({ category, source, text, meta }) {
 // =========================
 // GRAPH API (timeout + retries + logs)
 // =========================
-async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 8000 } = {}) {
-  const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(accessToken)}`;
+async function graphPost(
+  path,
+  payload,
+  accessToken,
+  { retries = 2, timeoutMs = 8000 } = {}
+) {
+  const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(
+    accessToken
+  )}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
@@ -162,7 +212,7 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
 
       const text = await r.text();
       if (!r.ok) {
-        console.error("GRAPH_ERROR", { path, status: r.status, body: text });
+        console.error("GRAPH_ERROR", { url, status: r.status, body: text });
         throw new Error(`Graph API ${r.status}: ${text}`);
       }
 
@@ -173,7 +223,7 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
       }
     } catch (e) {
       clearTimeout(t);
-      console.error("GRAPH_FETCH_FAIL", { path, attempt, error: String(e) });
+      console.error("GRAPH_FETCH_FAIL", { url, attempt, error: String(e) });
 
       if (attempt === retries) throw e;
       await sleep(350 * (attempt + 1));
@@ -184,9 +234,6 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
 // =========================
 // ACTIONS
 // =========================
-
-// Responder comentario IG:
-// Endpoint: /{comment-id}/replies  { message: "..." }
 async function replyToComment(commentId, message) {
   if (!IG_ACCESS_TOKEN) {
     console.warn("COMMENT_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
@@ -195,8 +242,6 @@ async function replyToComment(commentId, message) {
   return graphPost(`${commentId}/replies`, { message }, IG_ACCESS_TOKEN);
 }
 
-// Responder DM (IG o FB) vía Messenger API:
-// Endpoint: /me/messages con PAGE_ACCESS_TOKEN
 async function replyToDM(psid, message) {
   if (!PAGE_ACCESS_TOKEN) {
     console.warn("DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
@@ -204,7 +249,6 @@ async function replyToDM(psid, message) {
   }
   const payload = {
     recipient: { id: psid },
-    messaging_type: "RESPONSE",
     message: { text: message },
   };
   return graphPost(`me/messages`, payload, PAGE_ACCESS_TOKEN);
@@ -233,8 +277,6 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body || {};
-    const object = body.object || "unknown";
-
     console.log("WEBHOOK_IN", JSON.stringify(body));
 
     const entries = Array.isArray(body.entry) ? body.entry : [];
@@ -243,56 +285,57 @@ export default async function handler(req, res) {
       // =========================
       // A) MENSAJES (DM)
       // =========================
-      // Meta manda muchos tipos de eventos en entry.messaging:
-      // - message.text (lo que queremos)
-      // - delivery / read / postback / referral / etc. (NO responder)
       if (Array.isArray(entry.messaging)) {
-        const entryId = String(entry.id || ""); // en IG: IG business id; en FB: page id
-
         for (const m of entry.messaging) {
-          // 0) Ignora eventos no-mensaje (reads/deliveries/etc.)
-          if (m.delivery || m.read || m.postback || m.referral || m.optin) continue;
+          // 0) IGNORA eventos que NO son mensaje
+          if (m.delivery || m.read || m.postback || m.optin) continue;
 
-          // 1) Solo responder si hay texto REAL
-          const text = m?.message?.text;
-          if (typeof text !== "string" || !text.trim()) continue;
+          // 1) IGNORA eco del bot
+          if (m.message?.is_echo) continue;
 
-          // 2) Ignora eco-messages del propio sistema
-          if (m?.message?.is_echo) continue;
+          const psid = m.sender?.id;
+          if (!psid) continue;
 
-          // 3) Dedupe por message id (evita retries/duplicados)
-          const mid = m?.message?.mid;
-          if (alreadySeen(mid)) {
+          // 2) PROCESA SOLO si hay mensaje real (texto o attachments)
+          const hasText = typeof m.message?.text === "string" && m.message.text.trim().length > 0;
+          const hasAttachments = Array.isArray(m.message?.attachments) && m.message.attachments.length > 0;
+
+          if (!hasText && !hasAttachments) {
+            // Si llega algo raro sin texto/attachments, NO respondas
+            continue;
+          }
+
+          // 3) DEDUPE por message id (mid)
+          const mid = m.message?.mid;
+          if (mid && seenRecently(`dm:${mid}`)) {
             console.log("DM_DUPLICATE_SKIPPED", { mid });
             continue;
           }
 
-          const senderId = String(m?.sender?.id || "");
-          if (!senderId) continue;
-
-          // 4) Ignora mensajes que "parecen" salir de tu propia cuenta/page (previene loops raros)
-          // (en IG suele venir entry.id como tu IG business id)
-          if (entryId && senderId === entryId) continue;
-
+          const text = hasText ? m.message.text : "[attachment]";
           const category = classify(text);
           const reply = buildAutoReply(category);
 
-          // Responde
+          // 4) Responde
           try {
-            await replyToDM(senderId, reply);
-            console.log("DM_REPLIED", { object, senderId, category, mid });
+            await replyToDM(psid, reply);
+            console.log("DM_REPLIED", { psid, category, mid: mid || null });
           } catch (e) {
-            console.error("DM_REPLY_FAIL", { object, senderId, error: String(e) });
+            console.error("DM_REPLY_FAIL", String(e));
           }
 
-          // Escala por correo si aplica
-          if (category !== "general") {
-            await sendRoutingEmail({
-              category,
-              source: object === "instagram" ? "IG_DM" : "DM",
-              text,
-              meta: { senderId, entryId: entry.id || null, mid },
-            });
+          // 5) Escala por correo solo si tiene texto y no es general
+          if (hasText && category !== "general") {
+            try {
+              await sendRoutingEmail({
+                category,
+                source: "DM",
+                text,
+                meta: { psid, mid: mid || null, entryId: entry.id || null },
+              });
+            } catch (e) {
+              console.error("EMAIL_FAIL", String(e));
+            }
           }
         }
       }
@@ -300,7 +343,6 @@ export default async function handler(req, res) {
       // =========================
       // B) COMMENTS (comentarios)
       // =========================
-      // Estructura común: entry.changes[] con field = "comments" o "live_comments"
       if (Array.isArray(entry.changes)) {
         for (const c of entry.changes) {
           const field = c.field;
@@ -313,6 +355,12 @@ export default async function handler(req, res) {
 
             if (!commentId) continue;
 
+            // DEDUPE comentarios
+            if (seenRecently(`cmt:${commentId}`)) {
+              console.log("COMMENT_DUPLICATE_SKIPPED", { commentId });
+              continue;
+            }
+
             const category = classify(text);
             const reply = buildAutoReply(category);
 
@@ -324,12 +372,16 @@ export default async function handler(req, res) {
             }
 
             if (category !== "general") {
-              await sendRoutingEmail({
-                category,
-                source: "COMMENT",
-                text,
-                meta: { commentId, from, field },
-              });
+              try {
+                await sendRoutingEmail({
+                  category,
+                  source: "COMMENT",
+                  text,
+                  meta: { commentId, from, field },
+                });
+              } catch (e) {
+                console.error("EMAIL_FAIL", String(e));
+              }
             }
           }
         }
@@ -339,6 +391,7 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("WEBHOOK_FATAL", err);
+    // Importante: 200 para que Meta no reintente agresivamente
     return res.status(200).json({ ok: true });
   }
 }
