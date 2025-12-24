@@ -5,11 +5,15 @@ import nodemailer from "nodemailer";
 // ENV
 // =========================
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "orijen_rd_verify_2025";
+const API_VERSION = process.env.META_API_VERSION || "v24.0";
 
-// Tokens
-// IG_ACCESS_TOKEN: para responder COMENTARIOS (Graph IG comment replies)
+// Instagram Messaging API
+// OJO: este debe ser el token que funciona con graph.instagram.com (muchas veces empieza con IGAA...)
 const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "";
-// PAGE_ACCESS_TOKEN: para responder DMs vía /me/messages (Messenger platform / IG messaging)
+// IG Business Account ID (el id 1784... que te sale en la sección de IG)
+const IG_BUSINESS_ID = process.env.IG_BUSINESS_ID || "";
+
+// Facebook Page Messaging (opcional, solo si también quieres responder mensajes de la página)
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";
 
 // Email
@@ -18,8 +22,6 @@ const EMAIL_USER = process.env.EMAIL_USER || "";
 const EMAIL_PASS = process.env.EMAIL_PASS || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
 const EMAIL_TO_DEFAULT = process.env.EMAIL_TO_DEFAULT || "sbernal@decodeegroup.com";
-
-// Opcionales por área (si no existen, cae al default)
 const EMAIL_TO_SALES = process.env.EMAIL_TO_SALES || EMAIL_TO_DEFAULT;
 const EMAIL_TO_PRICING = process.env.EMAIL_TO_PRICING || EMAIL_TO_DEFAULT;
 const EMAIL_TO_EMERGENCY = process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT;
@@ -28,45 +30,15 @@ const EMAIL_TO_EMERGENCY = process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT;
 // KEYWORDS (ajústalas)
 // =========================
 const KW_PRICING = [
-  "precio",
-  "precios",
-  "cuanto",
-  "cuánto",
-  "costo",
-  "costos",
-  "vale",
-  "valor",
-  "tarifa",
-  "promoción",
-  "promo",
+  "precio", "precios", "cuanto", "cuánto", "costo", "costos", "vale", "valor", "tarifa", "promoción", "promo",
 ];
 
 const KW_SALES = [
-  "comprar",
-  "compra",
-  "pedido",
-  "orden",
-  "cotizar",
-  "cotización",
-  "stock",
-  "disponible",
-  "envío",
-  "delivery",
-  "tienda",
-  "distribuidor",
+  "comprar", "compra", "pedido", "orden", "cotizar", "cotización", "stock", "disponible", "envío", "delivery", "tienda", "distribuidor",
 ];
 
 const KW_EMERGENCY = [
-  "urgente",
-  "emergencia",
-  "intoxicación",
-  "intoxicacion",
-  "vomito",
-  "vómito",
-  "convulsión",
-  "convulsion",
-  "sangre",
-  "accidente",
+  "urgente", "emergencia", "intoxicación", "intoxicacion", "vomito", "vómito", "convulsión", "convulsion", "sangre", "accidente",
 ];
 
 // =========================
@@ -75,10 +47,7 @@ const KW_EMERGENCY = [
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function norm(s = "") {
-  return String(s)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
+  return String(s).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 function hasAnyKeyword(text, list) {
   const t = norm(text);
@@ -96,13 +65,12 @@ function pickEmail(category) {
   if (category === "sales") return EMAIL_TO_SALES;
   return EMAIL_TO_DEFAULT;
 }
-
 function buildAutoReply(category) {
   if (category === "emergency") {
     return "¡Gracias por escribirnos! Por seguridad, si tu mascota presenta una situación urgente, contáctanos de inmediato por el canal de emergencias o llama a la clínica. Si puedes, envíanos: especie/edad, síntomas y desde cuándo inició.";
   }
   if (category === "pricing") {
-    return "¡Claro! Te ayudamos con precios. Para cotizar exacto, dime el producto/servicio que necesitas y tu ubicación (si aplica). En breve te respondemos con el detalle.";
+    return "¡Claro! Te ayudamos con precios. Para cotizar exacto, dime el producto que necesitas y tu ubicación (si aplica). En breve te respondemos con el detalle.";
   }
   if (category === "sales") {
     return "¡Perfecto! Para ayudarte con tu compra, dime qué necesitas, cantidad y si es para entrega o recogida. Te respondemos con disponibilidad y pasos a seguir.";
@@ -111,33 +79,23 @@ function buildAutoReply(category) {
 }
 
 // =========================
-// SIMPLE DEDUPE (serverless best-effort)
+// DEDUPE (evita reintentos / loops)
 // =========================
-// Evita duplicados por reintentos de Meta o eventos repetidos.
-// Nota: En serverless no es 100% persistente, pero reduce MUCHO el spam.
-const GLOBAL_KEY = "__ORIJEN_DEDUPE_CACHE__";
-function getCache() {
-  if (!globalThis[GLOBAL_KEY]) {
-    globalThis[GLOBAL_KEY] = new Map(); // key -> expiresAt
-  }
-  return globalThis[GLOBAL_KEY];
-}
-function seenRecently(key, ttlMs = 10 * 60 * 1000) {
-  if (!key) return false;
-  const cache = getCache();
+// Cache en memoria (serverless). Ayuda muchísimo con duplicados por reintento.
+globalThis.__SEEN_MIDS__ = globalThis.__SEEN_MIDS__ || new Map();
+
+function seenMid(mid) {
+  if (!mid) return false;
   const now = Date.now();
+  const cache = globalThis.__SEEN_MIDS__;
 
-  // cleanup ligero
-  if (cache.size > 1000) {
-    for (const [k, exp] of cache.entries()) {
-      if (exp <= now) cache.delete(k);
-    }
+  // Limpieza básica (TTL 10 min)
+  for (const [k, ts] of cache.entries()) {
+    if (now - ts > 10 * 60 * 1000) cache.delete(k);
   }
 
-  const exp = cache.get(key);
-  if (exp && exp > now) return true;
-
-  cache.set(key, now + ttlMs);
+  if (cache.has(mid)) return true;
+  cache.set(mid, now);
   return false;
 }
 
@@ -146,9 +104,8 @@ function seenRecently(key, ttlMs = 10 * 60 * 1000) {
 // =========================
 function getTransporter() {
   if (!EMAIL_USER || !EMAIL_PASS) return null;
-
   return nodemailer.createTransport({
-    service: EMAIL_PROVIDER, // "gmail"
+    service: EMAIL_PROVIDER,
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
   });
 }
@@ -184,17 +141,10 @@ async function sendRoutingEmail({ category, source, text, meta }) {
 }
 
 // =========================
-// GRAPH API (timeout + retries + logs)
+// GRAPH POST (con timeout+retries)
 // =========================
-async function graphPost(
-  path,
-  payload,
-  accessToken,
-  { retries = 2, timeoutMs = 8000 } = {}
-) {
-  const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(
-    accessToken
-  )}`;
+async function graphPost({ baseUrl, path, payload, accessToken, retries = 2, timeoutMs = 8000 }) {
+  const url = `${baseUrl}/${API_VERSION}/${path}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
@@ -203,28 +153,32 @@ async function graphPost(
     try {
       const r = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          // IG Messaging usa Bearer OK, FB Page también lo acepta en muchos casos,
+          // pero para FB Page también funciona ?access_token=. Aquí mantenemos Bearer.
+          Authorization: `Bearer ${accessToken}`,
+        },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
 
       clearTimeout(t);
 
-      const text = await r.text();
+      const txt = await r.text();
       if (!r.ok) {
-        console.error("GRAPH_ERROR", { url, status: r.status, body: text });
-        throw new Error(`Graph API ${r.status}: ${text}`);
+        console.error("GRAPH_ERROR", { url, status: r.status, body: txt });
+        throw new Error(`Graph API ${r.status}: ${txt}`);
       }
 
       try {
-        return JSON.parse(text);
+        return JSON.parse(txt);
       } catch {
-        return text;
+        return txt;
       }
     } catch (e) {
       clearTimeout(t);
       console.error("GRAPH_FETCH_FAIL", { url, attempt, error: String(e) });
-
       if (attempt === retries) throw e;
       await sleep(350 * (attempt + 1));
     }
@@ -234,24 +188,63 @@ async function graphPost(
 // =========================
 // ACTIONS
 // =========================
+
+// IG DM Reply (Instagram Messaging API)
+// Endpoint (según integration assistant): POST https://graph.instagram.com/vXX.X/me/messages
+async function replyToIGDM(recipientId, message) {
+  if (!IG_ACCESS_TOKEN) {
+    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
+    return;
+  }
+
+  const payload = {
+    recipient: { id: recipientId },
+    message: { text: message },
+  };
+
+  // IMPORTANTE: baseUrl = graph.instagram.com (no graph.facebook.com)
+  return graphPost({
+    baseUrl: "https://graph.instagram.com",
+    path: "me/messages",
+    payload,
+    accessToken: IG_ACCESS_TOKEN,
+  });
+}
+
+// FB Page DM Reply (solo si lo necesitas)
+// Endpoint: POST https://graph.facebook.com/vXX.X/me/messages
+async function replyToFBPageDM(psid, message) {
+  if (!PAGE_ACCESS_TOKEN) {
+    console.warn("FB_DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
+    return;
+  }
+
+  const payload = {
+    recipient: { id: psid },
+    message: { text: message },
+  };
+
+  return graphPost({
+    baseUrl: "https://graph.facebook.com",
+    path: "me/messages",
+    payload,
+    accessToken: PAGE_ACCESS_TOKEN,
+  });
+}
+
+// Comentarios IG (si lo estás usando)
+// OJO: comentarios sí van por graph.facebook.com usualmente (IG Graph)
 async function replyToComment(commentId, message) {
   if (!IG_ACCESS_TOKEN) {
     console.warn("COMMENT_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
     return;
   }
-  return graphPost(`${commentId}/replies`, { message }, IG_ACCESS_TOKEN);
-}
-
-async function replyToDM(psid, message) {
-  if (!PAGE_ACCESS_TOKEN) {
-    console.warn("DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
-    return;
-  }
-  const payload = {
-    recipient: { id: psid },
-    message: { text: message },
-  };
-  return graphPost(`me/messages`, payload, PAGE_ACCESS_TOKEN);
+  return graphPost({
+    baseUrl: "https://graph.facebook.com",
+    path: `${commentId}/replies`,
+    payload: { message },
+    accessToken: IG_ACCESS_TOKEN,
+  });
 }
 
 // =========================
@@ -271,78 +264,74 @@ export default async function handler(req, res) {
   }
 
   // 2) EVENTOS
-  if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
     const body = req.body || {};
     console.log("WEBHOOK_IN", JSON.stringify(body));
 
+    const objectType = body.object; // "instagram" o "page"
     const entries = Array.isArray(body.entry) ? body.entry : [];
 
     for (const entry of entries) {
-      // =========================
-      // A) MENSAJES (DM)
-      // =========================
+      // A) MENSAJES (entry.messaging)
       if (Array.isArray(entry.messaging)) {
         for (const m of entry.messaging) {
-          // 0) IGNORA eventos que NO son mensaje
-          if (m.delivery || m.read || m.postback || m.optin) continue;
+          // 1) Ignora mensajes eco del propio bot (evita loops)
+          if (m?.message?.is_echo) continue;
 
-          // 1) IGNORA eco del bot
-          if (m.message?.is_echo) continue;
+          // 2) Ignora eventos técnicos (delivery/read/etc.)
+          // Si no hay m.message, NO es un mensaje real del usuario.
+          if (!m.message) continue;
 
-          const psid = m.sender?.id;
-          if (!psid) continue;
+          // 3) Dedup por message mid (evita reintentos/duplicados)
+          const mid = m.message?.mid;
+          if (seenMid(mid)) {
+            console.log("DEDUP_SKIP", { mid });
+            continue;
+          }
 
-          // 2) PROCESA SOLO si hay mensaje real (texto o attachments)
-          const hasText = typeof m.message?.text === "string" && m.message.text.trim().length > 0;
+          // 4) Obtén remitente + contenido
+          const senderId = m.sender?.id;
+          if (!senderId) continue;
+
+          const text = typeof m.message?.text === "string" ? m.message.text : "";
           const hasAttachments = Array.isArray(m.message?.attachments) && m.message.attachments.length > 0;
 
-          if (!hasText && !hasAttachments) {
-            // Si llega algo raro sin texto/attachments, NO respondas
-            continue;
-          }
+          // Si no hay texto ni attachments, ignora
+          if (!text && !hasAttachments) continue;
 
-          // 3) DEDUPE por message id (mid)
-          const mid = m.message?.mid;
-          if (mid && seenRecently(`dm:${mid}`)) {
-            console.log("DM_DUPLICATE_SKIPPED", { mid });
-            continue;
-          }
-
-          const text = hasText ? m.message.text : "[attachment]";
           const category = classify(text);
           const reply = buildAutoReply(category);
 
-          // 4) Responde
+          // 5) Responder según el tipo de objeto
           try {
-            await replyToDM(psid, reply);
-            console.log("DM_REPLIED", { psid, category, mid: mid || null });
+            if (objectType === "instagram") {
+              // Instagram DM
+              await replyToIGDM(senderId, reply);
+              console.log("IG_DM_REPLIED", { senderId, category, mid });
+            } else {
+              // Facebook Page DM
+              await replyToFBPageDM(senderId, reply);
+              console.log("FB_DM_REPLIED", { senderId, category, mid });
+            }
           } catch (e) {
             console.error("DM_REPLY_FAIL", String(e));
           }
 
-          // 5) Escala por correo solo si tiene texto y no es general
-          if (hasText && category !== "general") {
-            try {
-              await sendRoutingEmail({
-                category,
-                source: "DM",
-                text,
-                meta: { psid, mid: mid || null, entryId: entry.id || null },
-              });
-            } catch (e) {
-              console.error("EMAIL_FAIL", String(e));
-            }
+          // 6) Escala por correo si aplica
+          if (category !== "general") {
+            await sendRoutingEmail({
+              category,
+              source: objectType === "instagram" ? "IG_DM" : "FB_DM",
+              text: text || "(attachment)",
+              meta: { senderId, mid, entryId: entry.id || null },
+            });
           }
         }
       }
 
-      // =========================
-      // B) COMMENTS (comentarios)
-      // =========================
+      // B) COMMENTS (entry.changes)
       if (Array.isArray(entry.changes)) {
         for (const c of entry.changes) {
           const field = c.field;
@@ -355,12 +344,6 @@ export default async function handler(req, res) {
 
             if (!commentId) continue;
 
-            // DEDUPE comentarios
-            if (seenRecently(`cmt:${commentId}`)) {
-              console.log("COMMENT_DUPLICATE_SKIPPED", { commentId });
-              continue;
-            }
-
             const category = classify(text);
             const reply = buildAutoReply(category);
 
@@ -372,16 +355,12 @@ export default async function handler(req, res) {
             }
 
             if (category !== "general") {
-              try {
-                await sendRoutingEmail({
-                  category,
-                  source: "COMMENT",
-                  text,
-                  meta: { commentId, from, field },
-                });
-              } catch (e) {
-                console.error("EMAIL_FAIL", String(e));
-              }
+              await sendRoutingEmail({
+                category,
+                source: "COMMENT",
+                text,
+                meta: { commentId, from, field },
+              });
             }
           }
         }
@@ -391,7 +370,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("WEBHOOK_FATAL", err);
-    // Importante: 200 para que Meta no reintente agresivamente
     return res.status(200).json({ ok: true });
   }
 }
