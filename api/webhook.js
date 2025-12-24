@@ -1,81 +1,35 @@
 // /api/webhook.js
 import nodemailer from "nodemailer";
 
-/**
- * ORIJEN RD - Meta Webhook (IG + Messenger) - FINAL
- * - Usa PAGE_ACCESS_TOKEN como token principal (producción).
- * - IG_ACCESS_TOKEN queda como fallback opcional (si lo quieres usar).
- * - Responde DMs (Instagram / Messenger) vía Send API: POST /me/messages
- * - Responde comentarios IG vía: POST /{comment-id}/replies
- */
-
 // =========================
 // ENV
 // =========================
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "orijen_rd_verify_2025";
 
-// Token principal (producción)
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || ""; // ✅ Page token con permisos IG + FB
+// Instagram Messaging (token IGA... del asistente / Instagram Login)
+const IG_ACCESS_TOKEN = (process.env.IG_ACCESS_TOKEN || "").trim();
 
-// Fallback opcional (no requerido si tu Page token ya tiene IG perms)
-const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "";
+// Facebook Page Messenger (si usas FB Messenger)
+const PAGE_ACCESS_TOKEN = (process.env.PAGE_ACCESS_TOKEN || "").trim();
 
 // Email
 const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "gmail";
-const EMAIL_USER = process.env.EMAIL_USER || "";
-const EMAIL_PASS = process.env.EMAIL_PASS || "";
-const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
-const EMAIL_TO_DEFAULT =
-  process.env.EMAIL_TO_DEFAULT || "sbernal@decodeegroup.com";
+const EMAIL_USER = (process.env.EMAIL_USER || "").trim();
+const EMAIL_PASS = (process.env.EMAIL_PASS || "").trim();
+const EMAIL_FROM = (process.env.EMAIL_FROM || EMAIL_USER).trim();
+const EMAIL_TO_DEFAULT = (process.env.EMAIL_TO_DEFAULT || "sbernal@decodeegroup.com").trim();
 
-const EMAIL_TO_SALES = process.env.EMAIL_TO_SALES || EMAIL_TO_DEFAULT;
-const EMAIL_TO_PRICING = process.env.EMAIL_TO_PRICING || EMAIL_TO_DEFAULT;
-const EMAIL_TO_EMERGENCY = process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT;
+// Opcionales por área
+const EMAIL_TO_SALES = (process.env.EMAIL_TO_SALES || EMAIL_TO_DEFAULT).trim();
+const EMAIL_TO_PRICING = (process.env.EMAIL_TO_PRICING || EMAIL_TO_DEFAULT).trim();
+const EMAIL_TO_EMERGENCY = (process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT).trim();
 
 // =========================
 // KEYWORDS
 // =========================
-const KW_PRICING = [
-  "precio",
-  "precios",
-  "cuanto",
-  "cuánto",
-  "costo",
-  "costos",
-  "vale",
-  "valor",
-  "tarifa",
-  "promoción",
-  "promo",
-];
-
-const KW_SALES = [
-  "comprar",
-  "compra",
-  "pedido",
-  "orden",
-  "cotizar",
-  "cotización",
-  "stock",
-  "disponible",
-  "envío",
-  "delivery",
-  "tienda",
-  "distribuidor",
-];
-
-const KW_EMERGENCY = [
-  "urgente",
-  "emergencia",
-  "intoxicación",
-  "intoxicacion",
-  "vomito",
-  "vómito",
-  "convulsión",
-  "convulsion",
-  "sangre",
-  "accidente",
-];
+const KW_PRICING = ["precio", "precios", "cuanto", "cuánto", "costo", "costos", "vale", "valor", "tarifa", "promoción", "promo"];
+const KW_SALES = ["comprar", "compra", "pedido", "orden", "cotizar", "cotización", "stock", "disponible", "envío", "delivery", "tienda", "distribuidor"];
+const KW_EMERGENCY = ["urgente", "emergencia", "intoxicación", "intoxicacion", "vomito", "vómito", "convulsión", "convulsion", "sangre", "accidente"];
 
 // =========================
 // HELPERS
@@ -83,37 +37,30 @@ const KW_EMERGENCY = [
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function norm(s = "") {
-  return String(s)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
+  return String(s).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
-
 function hasAnyKeyword(text, list) {
   const t = norm(text);
   return list.some((k) => t.includes(norm(k)));
 }
-
 function classify(text) {
   if (hasAnyKeyword(text, KW_EMERGENCY)) return "emergency";
   if (hasAnyKeyword(text, KW_PRICING)) return "pricing";
   if (hasAnyKeyword(text, KW_SALES)) return "sales";
   return "general";
 }
-
 function pickEmail(category) {
   if (category === "emergency") return EMAIL_TO_EMERGENCY;
   if (category === "pricing") return EMAIL_TO_PRICING;
   if (category === "sales") return EMAIL_TO_SALES;
   return EMAIL_TO_DEFAULT;
 }
-
 function buildAutoReply(category) {
   if (category === "emergency") {
     return "¡Gracias por escribirnos! Por seguridad, si tu mascota presenta una situación urgente, contáctanos de inmediato por el canal de emergencias o llama a la clínica. Si puedes, envíanos: especie/edad, síntomas y desde cuándo inició.";
   }
   if (category === "pricing") {
-    return "¡Claro! Te ayudamos con precios. Para cotizar exacto, dime el producto/servicio que necesitas y tu ubicación (si aplica). En breve te respondemos con el detalle.";
+    return "¡Claro! Te ayudamos con precios. Para cotizar exacto, dime el producto que necesitas y tu ubicación (si aplica). En breve te respondemos con el detalle.";
   }
   if (category === "sales") {
     return "¡Perfecto! Para ayudarte con tu compra, dime qué necesitas, cantidad y si es para entrega o recogida. Te respondemos con disponibilidad y pasos a seguir.";
@@ -164,50 +111,43 @@ async function sendRoutingEmail({ category, source, text, meta }) {
 }
 
 // =========================
-// GRAPH API
+// HTTP helpers
 // =========================
-async function graphPost(
-  path,
-  payload,
-  accessToken,
-  { retries = 2, timeoutMs = 9000 } = {}
-) {
-  if (!accessToken) throw new Error("Missing access token");
+async function httpJson(url, { method = "GET", headers = {}, body, timeoutMs = 10000 } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
-  const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(
-    accessToken
-  )}`;
+  try {
+    const r = await fetch(url, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), timeoutMs);
+    const text = await r.text();
+    let parsed = text;
+    try { parsed = JSON.parse(text); } catch {}
 
+    if (!r.ok) {
+      const err = typeof parsed === "string" ? parsed : JSON.stringify(parsed);
+      throw new Error(`${r.status} ${r.statusText} :: ${err}`);
+    }
+
+    return parsed;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function withRetries(fn, { retries = 2 } = {}) {
+  for (let i = 0; i <= retries; i++) {
     try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      clearTimeout(t);
-
-      const raw = await r.text();
-      if (!r.ok) {
-        console.error("GRAPH_ERROR", { path, status: r.status, body: raw });
-        throw new Error(`Graph API ${r.status}: ${raw}`);
-      }
-
-      try {
-        return JSON.parse(raw);
-      } catch {
-        return raw;
-      }
+      return await fn();
     } catch (e) {
-      clearTimeout(t);
-      console.error("GRAPH_FETCH_FAIL", { path, attempt, error: String(e) });
-      if (attempt === retries) throw e;
-      await sleep(400 * (attempt + 1));
+      console.error("REQ_FAIL", { attempt: i, error: String(e) });
+      if (i === retries) throw e;
+      await sleep(350 * (i + 1));
     }
   }
 }
@@ -216,32 +156,67 @@ async function graphPost(
 // ACTIONS
 // =========================
 
-// ✅ Responder DM (IG o FB) via Send API
-// Endpoint: POST /me/messages
-async function replyToDM(recipientId, message) {
-  if (!PAGE_ACCESS_TOKEN) {
-    console.warn("DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
+// ✅ IG DM reply (Instagram Messaging API)
+// Usa el mismo endpoint que te muestra el Asistente: graph.instagram.com/v21.0/me/messages
+async function replyToIGDM(recipientId, message) {
+  if (!IG_ACCESS_TOKEN) {
+    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
     return;
   }
 
-  const payload = {
-    recipient: { id: recipientId },
-    message: { text: message },
-  };
-
-  return graphPost("me/messages", payload, PAGE_ACCESS_TOKEN);
+  const url = "https://graph.instagram.com/v21.0/me/messages";
+  return withRetries(() =>
+    httpJson(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${IG_ACCESS_TOKEN}`,
+      },
+      body: {
+        recipient: { id: String(recipientId) },
+        message: { text: message },
+      },
+    })
+  );
 }
 
-// ✅ Responder comentario IG
-// Endpoint: POST /{comment-id}/replies  { message }
-async function replyToComment(commentId, message) {
-  const tokenToUse = PAGE_ACCESS_TOKEN || IG_ACCESS_TOKEN;
-  if (!tokenToUse) {
-    console.warn("COMMENT_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN/IG_ACCESS_TOKEN");
+// ✅ Facebook Page Messenger reply (opcional)
+async function replyToFBPageDM(psid, message) {
+  if (!PAGE_ACCESS_TOKEN) {
+    console.warn("FB_DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
     return;
   }
 
-  return graphPost(`${commentId}/replies`, { message }, tokenToUse);
+  const url = `https://graph.facebook.com/v24.0/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
+  return withRetries(() =>
+    httpJson(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: {
+        recipient: { id: String(psid) },
+        message: { text: message },
+      },
+    })
+  );
+}
+
+// ✅ IG comment reply (Graph API)
+async function replyToComment(commentId, message) {
+  if (!IG_ACCESS_TOKEN) {
+    console.warn("COMMENT_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
+    return;
+  }
+
+  // Para comentarios suele funcionar con graph.facebook.com + access_token
+  const url = `https://graph.facebook.com/v24.0/${commentId}/replies?access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`;
+
+  return withRetries(() =>
+    httpJson(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: { message },
+    })
+  );
 }
 
 // =========================
@@ -261,72 +236,67 @@ export default async function handler(req, res) {
   }
 
   // 2) EVENTOS
-  if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
     const body = req.body || {};
     console.log("WEBHOOK_IN", JSON.stringify(body));
 
+    const object = body.object; // "instagram" o "page"
     const entries = Array.isArray(body.entry) ? body.entry : [];
 
     for (const entry of entries) {
-      /**
-       * A) MENSAJES (DM)
-       * Estructura típica:
-       * entry.messaging[] con:
-       * - sender.id (usuario)
-       * - recipient.id (tu IG business id o page id)
-       * - message.text
-       */
+      // =========================
+      // A) DM (Instagram o Page)
+      // =========================
       if (Array.isArray(entry.messaging)) {
         for (const m of entry.messaging) {
-          const senderId = m.sender?.id; // el usuario que escribió
-          const text = m.message?.text || "";
-
-          // ignorar eco-messages
+          // Ignorar eco mensajes
           if (m.message?.is_echo) continue;
+
+          const text = m.message?.text || "";
+          const senderId = m.sender?.id; // el id del usuario que escribió
+
           if (!senderId) continue;
 
           const category = classify(text);
           const reply = buildAutoReply(category);
 
-          // 1) Responder DM
           try {
-            await replyToDM(senderId, reply);
-            console.log("DM_REPLIED", { senderId, category });
+            if (object === "instagram") {
+              await replyToIGDM(senderId, reply);
+              console.log("IG_DM_REPLIED", { senderId, category });
+            } else if (object === "page") {
+              await replyToFBPageDM(senderId, reply);
+              console.log("FB_DM_REPLIED", { senderId, category });
+            } else {
+              console.warn("DM_SKIPPED_UNKNOWN_OBJECT", object);
+            }
           } catch (e) {
-            console.error("DM_REPLY_FAIL", String(e));
+            console.error("DM_REPLY_FAIL", { object, error: String(e) });
           }
 
-          // 2) Email si aplica
+          // Escalar por correo si aplica
           if (category !== "general") {
             await sendRoutingEmail({
               category,
-              source: "DM",
+              source: object === "instagram" ? "IG_DM" : "FB_DM",
               text,
-              meta: {
-                senderId,
-                entryId: entry.id || null,
-                object: body.object || null,
-              },
+              meta: { senderId, entryId: entry.id || null },
             });
           }
         }
       }
 
-      /**
-       * B) COMMENTS
-       * IG suele mandar:
-       * entry.changes[] con field="comments" o "live_comments"
-       * value.id (commentId), value.text, value.from
-       */
+      // =========================
+      // B) COMMENTS (IG)
+      // =========================
       if (Array.isArray(entry.changes)) {
         for (const c of entry.changes) {
           const field = c.field;
           const value = c.value || {};
 
+          // Comentarios (depende del producto puede variar)
           if (field === "comments" || field === "live_comments") {
             const text = value.text || "";
             const commentId = value.id;
@@ -337,7 +307,6 @@ export default async function handler(req, res) {
             const category = classify(text);
             const reply = buildAutoReply(category);
 
-            // 1) Responder comentario
             try {
               await replyToComment(commentId, reply);
               console.log("COMMENT_REPLIED", { commentId, category });
@@ -345,7 +314,6 @@ export default async function handler(req, res) {
               console.error("COMMENT_REPLY_FAIL", String(e));
             }
 
-            // 2) Email si aplica
             if (category !== "general") {
               await sendRoutingEmail({
                 category,
@@ -359,11 +327,10 @@ export default async function handler(req, res) {
       }
     }
 
-    // Meta requiere 200 rápido
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("WEBHOOK_FATAL", err);
-    // devolver 200 para que Meta no reintente con spam
+    console.error("WEBHOOK_FATAL", String(err));
+    // Meta requiere 200 para no reintentar en bucle
     return res.status(200).json({ ok: true });
   }
 }
