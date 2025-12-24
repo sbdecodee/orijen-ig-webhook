@@ -6,9 +6,12 @@ import nodemailer from "nodemailer";
 // =========================
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "orijen_rd_verify_2025";
 
-// Tokens
-const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || "";        // Instagram Graph
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";    // Messenger/DMs (Page token)
+// Tokens / IDs
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || ""; // Instagram Graph token (Business)
+const IG_BUSINESS_ID = process.env.IG_BUSINESS_ID || "";   // 1784140... (OBLIGATORIO para enviar DMs)
+
+// (Opcional) si más adelante quieres usar Messenger Page token
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";
 
 // Email
 const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "gmail";
@@ -81,7 +84,6 @@ function buildAutoReply(category) {
 function getTransporter() {
   if (!EMAIL_USER || !EMAIL_PASS) return null;
 
-  // Con Gmail debes usar App Password (ya lo hiciste).
   return nodemailer.createTransport({
     service: EMAIL_PROVIDER, // "gmail"
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
@@ -119,9 +121,9 @@ async function sendRoutingEmail({ category, source, text, meta }) {
 }
 
 // =========================
-// GRAPH API (FIX: timeout + retries + logs)
+// GRAPH API (timeout + retries + logs)
 // =========================
-async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 8000 } = {}) {
+async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 10000 } = {}) {
   const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(accessToken)}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -140,7 +142,7 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
 
       const text = await r.text();
       if (!r.ok) {
-        console.error("GRAPH_ERROR", { url, status: r.status, body: text });
+        console.error("GRAPH_ERROR", { path, status: r.status, body: text });
         throw new Error(`Graph API ${r.status}: ${text}`);
       }
 
@@ -151,10 +153,10 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
       }
     } catch (e) {
       clearTimeout(t);
-      console.error("GRAPH_FETCH_FAIL", { url, attempt, error: String(e) });
+      console.error("GRAPH_FETCH_FAIL", { path, attempt, error: String(e) });
 
       if (attempt === retries) throw e;
-      await sleep(350 * (attempt + 1));
+      await sleep(450 * (attempt + 1));
     }
   }
 }
@@ -164,8 +166,6 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
 // =========================
 
 // Responder comentario IG:
-// Necesitas tener comment_id y permisos/token válidos.
-// Endpoint típico: /{comment-id}/replies  { message: "..." }
 async function replyToComment(commentId, message) {
   if (!IG_ACCESS_TOKEN) {
     console.warn("COMMENT_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
@@ -174,11 +174,33 @@ async function replyToComment(commentId, message) {
   return graphPost(`${commentId}/replies`, { message }, IG_ACCESS_TOKEN);
 }
 
-// Responder DM (Messenger platform):
-// Endpoint típico: /me/messages con PAGE_ACCESS_TOKEN
-async function replyToDM(psid, message) {
+/**
+ * Responder DM IG (Instagram Messaging API):
+ * Endpoint: /{IG_BUSINESS_ID}/messages
+ * Payload:  recipient: { id }, message: { text }
+ */
+async function replyToIGDM(recipientId, message) {
+  if (!IG_ACCESS_TOKEN) {
+    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
+    return;
+  }
+  if (!IG_BUSINESS_ID) {
+    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_BUSINESS_ID (set it in Vercel)");
+    return;
+  }
+
+  const payload = {
+    recipient: { id: recipientId },
+    message: { text: message },
+  };
+
+  return graphPost(`${IG_BUSINESS_ID}/messages`, payload, IG_ACCESS_TOKEN);
+}
+
+// (Opcional) Responder DM por Messenger (Facebook Page)
+async function replyToFBMessenger(psid, message) {
   if (!PAGE_ACCESS_TOKEN) {
-    console.warn("DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
+    console.warn("FB_DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
     return;
   }
   const payload = {
@@ -213,55 +235,62 @@ export default async function handler(req, res) {
     const body = req.body || {};
     console.log("WEBHOOK_IN", JSON.stringify(body));
 
-    // Procesa "entry" (Meta manda arrays)
     const entries = Array.isArray(body.entry) ? body.entry : [];
 
     for (const entry of entries) {
-      // A) MENSAJES (DM)
-      // Estructura típica: entry.messaging[] (o changes según producto)
+      // A) MENSAJES (DMs)
+      // IG y FB pueden traer entry.messaging[]
       if (Array.isArray(entry.messaging)) {
         for (const m of entry.messaging) {
-          const psid = m.sender?.id; // user id
+          const senderId = m.sender?.id;         // usuario que escribió
+          const recipientId = m.recipient?.id;   // tu cuenta/page
           const text = m.message?.text || "";
 
           // Ignora eco-messages del propio bot
           if (m.message?.is_echo) continue;
-          if (!psid) continue;
+          if (!senderId) continue;
 
           const category = classify(text);
           const reply = buildAutoReply(category);
 
-          // 1) Responde al DM
+          // IMPORTANTE:
+          // Si esto viene de Instagram, responderemos con IG token usando IG_BUSINESS_ID/messages
+          // Si viene de Facebook Messenger, puedes responder con PAGE_ACCESS_TOKEN (opcional)
+          // Como tú quieres Instagram: usamos replyToIGDM SIEMPRE.
           try {
-            await replyToDM(psid, reply);
-            console.log("DM_REPLIED", { psid, category });
+            await replyToIGDM(senderId, reply);
+            console.log("IG_DM_REPLIED", { senderId, recipientId, category });
           } catch (e) {
-            console.error("DM_REPLY_FAIL", String(e));
+            console.error("IG_DM_REPLY_FAIL", String(e));
           }
 
-          // 2) Escala por correo si aplica (pricing/sales/emergency)
+          // Escala por correo si aplica
           if (category !== "general") {
             await sendRoutingEmail({
               category,
               source: "DM",
               text,
-              meta: { psid, entryId: entry.id || null },
+              meta: {
+                senderId,
+                recipientId,
+                entryId: entry.id || null,
+                timestamp: m.timestamp || null,
+              },
             });
           }
         }
       }
 
       // B) COMMENTS (comentarios)
-      // Estructura común en IG: entry.changes[] con field = "comments"
       if (Array.isArray(entry.changes)) {
         for (const c of entry.changes) {
           const field = c.field;
           const value = c.value || {};
 
-          // Comentarios
+          // IG comments
           if (field === "comments" || field === "live_comments") {
             const text = value.text || "";
-            const commentId = value.id; // muchas veces es el comment id
+            const commentId = value.id;
             const from = value.from?.username || value.from?.id || "unknown";
 
             if (!commentId) continue;
@@ -269,7 +298,6 @@ export default async function handler(req, res) {
             const category = classify(text);
             const reply = buildAutoReply(category);
 
-            // 1) Responde al comentario
             try {
               await replyToComment(commentId, reply);
               console.log("COMMENT_REPLIED", { commentId, category });
@@ -277,7 +305,6 @@ export default async function handler(req, res) {
               console.error("COMMENT_REPLY_FAIL", String(e));
             }
 
-            // 2) Escala por correo si aplica
             if (category !== "general") {
               await sendRoutingEmail({
                 category,
@@ -294,7 +321,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("WEBHOOK_FATAL", err);
-    // Igual devolvemos 200 si ya procesamos parte, pero aquí fue fatal
     return res.status(200).json({ ok: true });
   }
 }
