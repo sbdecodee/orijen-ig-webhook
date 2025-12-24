@@ -6,12 +6,12 @@ import nodemailer from "nodemailer";
 // =========================
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || "orijen_rd_verify_2025";
 
-// Tokens / IDs
-const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || ""; // Instagram Graph token (Business)
-const IG_BUSINESS_ID = process.env.IG_BUSINESS_ID || "";   // 1784140... (OBLIGATORIO para enviar DMs)
+// Instagram (DM + comentarios)
+const IG_ACCESS_TOKEN = process.env.IG_ACCESS_TOKEN || ""; // token IG (mensajería/comentarios)
+const IG_BUSINESS_ID = process.env.IG_BUSINESS_ID || "";   // 1784...
 
-// (Opcional) si más adelante quieres usar Messenger Page token
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || "";
+// Facebook Page (Messenger)
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN || ""; // token de la página (Messenger)
 
 // Email
 const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "gmail";
@@ -20,13 +20,12 @@ const EMAIL_PASS = process.env.EMAIL_PASS || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || EMAIL_USER;
 const EMAIL_TO_DEFAULT = process.env.EMAIL_TO_DEFAULT || "sbernal@decodeegroup.com";
 
-// Opcionales por área (si no existen, cae al default)
 const EMAIL_TO_SALES = process.env.EMAIL_TO_SALES || EMAIL_TO_DEFAULT;
 const EMAIL_TO_PRICING = process.env.EMAIL_TO_PRICING || EMAIL_TO_DEFAULT;
 const EMAIL_TO_EMERGENCY = process.env.EMAIL_TO_EMERGENCY || EMAIL_TO_DEFAULT;
 
 // =========================
-// KEYWORDS (ajústalas)
+// KEYWORDS
 // =========================
 const KW_PRICING = [
   "precio", "precios", "cuanto", "cuánto", "costo", "costos", "vale", "valor", "tarifa", "promoción", "promo",
@@ -83,9 +82,8 @@ function buildAutoReply(category) {
 // =========================
 function getTransporter() {
   if (!EMAIL_USER || !EMAIL_PASS) return null;
-
   return nodemailer.createTransport({
-    service: EMAIL_PROVIDER, // "gmail"
+    service: EMAIL_PROVIDER,
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
   });
 }
@@ -110,20 +108,16 @@ async function sendRoutingEmail({ category, source, text, meta }) {
     JSON.stringify(meta || {}, null, 2),
   ].join("\n");
 
-  await transporter.sendMail({
-    from: EMAIL_FROM,
-    to,
-    subject,
-    text: body,
-  });
-
+  await transporter.sendMail({ from: EMAIL_FROM, to, subject, text: body });
   console.log("EMAIL_SENT", { to, category, source });
 }
 
 // =========================
-// GRAPH API (timeout + retries + logs)
+// GRAPH API
 // =========================
-async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 10000 } = {}) {
+async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 8000 } = {}) {
+  if (!accessToken) throw new Error("Missing access token for Graph API");
+
   const url = `https://graph.facebook.com/v24.0/${path}?access_token=${encodeURIComponent(accessToken)}`;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -154,9 +148,8 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
     } catch (e) {
       clearTimeout(t);
       console.error("GRAPH_FETCH_FAIL", { path, attempt, error: String(e) });
-
       if (attempt === retries) throw e;
-      await sleep(450 * (attempt + 1));
+      await sleep(350 * (attempt + 1));
     }
   }
 }
@@ -165,7 +158,7 @@ async function graphPost(path, payload, accessToken, { retries = 2, timeoutMs = 
 // ACTIONS
 // =========================
 
-// Responder comentario IG:
+// Responder comentario IG: /{comment-id}/replies
 async function replyToComment(commentId, message) {
   if (!IG_ACCESS_TOKEN) {
     console.warn("COMMENT_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
@@ -174,39 +167,37 @@ async function replyToComment(commentId, message) {
   return graphPost(`${commentId}/replies`, { message }, IG_ACCESS_TOKEN);
 }
 
-/**
- * Responder DM IG (Instagram Messaging API):
- * Endpoint: /{IG_BUSINESS_ID}/messages
- * Payload:  recipient: { id }, message: { text }
- */
-async function replyToIGDM(recipientId, message) {
+// Responder DM Instagram: /{IG_BUSINESS_ID}/messages
+async function replyToIGDM(psid, message) {
   if (!IG_ACCESS_TOKEN) {
     console.warn("IG_DM_REPLY_SKIPPED: Missing IG_ACCESS_TOKEN");
     return;
   }
   if (!IG_BUSINESS_ID) {
-    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_BUSINESS_ID (set it in Vercel)");
+    console.warn("IG_DM_REPLY_SKIPPED: Missing IG_BUSINESS_ID");
     return;
   }
 
   const payload = {
-    recipient: { id: recipientId },
+    recipient: { id: psid },
     message: { text: message },
   };
 
   return graphPost(`${IG_BUSINESS_ID}/messages`, payload, IG_ACCESS_TOKEN);
 }
 
-// (Opcional) Responder DM por Messenger (Facebook Page)
+// Responder Messenger (Facebook Page): /me/messages
 async function replyToFBMessenger(psid, message) {
   if (!PAGE_ACCESS_TOKEN) {
     console.warn("FB_DM_REPLY_SKIPPED: Missing PAGE_ACCESS_TOKEN");
     return;
   }
+
   const payload = {
     recipient: { id: psid },
     message: { text: message },
   };
+
   return graphPost(`me/messages`, payload, PAGE_ACCESS_TOKEN);
 }
 
@@ -236,58 +227,51 @@ export default async function handler(req, res) {
     console.log("WEBHOOK_IN", JSON.stringify(body));
 
     const entries = Array.isArray(body.entry) ? body.entry : [];
+    const objectType = body.object || ""; // "instagram" o "page"
 
     for (const entry of entries) {
-      // A) MENSAJES (DMs)
-      // IG y FB pueden traer entry.messaging[]
+      // A) MENSAJES (DM)
       if (Array.isArray(entry.messaging)) {
         for (const m of entry.messaging) {
-          const senderId = m.sender?.id;         // usuario que escribió
-          const recipientId = m.recipient?.id;   // tu cuenta/page
+          const psid = m.sender?.id;
           const text = m.message?.text || "";
 
-          // Ignora eco-messages del propio bot
           if (m.message?.is_echo) continue;
-          if (!senderId) continue;
+          if (!psid) continue;
 
           const category = classify(text);
           const reply = buildAutoReply(category);
 
-          // IMPORTANTE:
-          // Si esto viene de Instagram, responderemos con IG token usando IG_BUSINESS_ID/messages
-          // Si viene de Facebook Messenger, puedes responder con PAGE_ACCESS_TOKEN (opcional)
-          // Como tú quieres Instagram: usamos replyToIGDM SIEMPRE.
+          // Responder según origen
           try {
-            await replyToIGDM(senderId, reply);
-            console.log("IG_DM_REPLIED", { senderId, recipientId, category });
+            if (objectType === "instagram") {
+              await replyToIGDM(psid, reply);
+              console.log("IG_DM_REPLIED", { psid, category });
+            } else {
+              await replyToFBMessenger(psid, reply);
+              console.log("FB_DM_REPLIED", { psid, category });
+            }
           } catch (e) {
-            console.error("IG_DM_REPLY_FAIL", String(e));
+            console.error("DM_REPLY_FAIL", String(e));
           }
 
-          // Escala por correo si aplica
           if (category !== "general") {
             await sendRoutingEmail({
               category,
-              source: "DM",
+              source: objectType === "instagram" ? "IG_DM" : "FB_DM",
               text,
-              meta: {
-                senderId,
-                recipientId,
-                entryId: entry.id || null,
-                timestamp: m.timestamp || null,
-              },
+              meta: { psid, entryId: entry.id || null },
             });
           }
         }
       }
 
-      // B) COMMENTS (comentarios)
+      // B) COMMENTS
       if (Array.isArray(entry.changes)) {
         for (const c of entry.changes) {
           const field = c.field;
           const value = c.value || {};
 
-          // IG comments
           if (field === "comments" || field === "live_comments") {
             const text = value.text || "";
             const commentId = value.id;
